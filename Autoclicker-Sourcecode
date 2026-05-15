@@ -1,0 +1,702 @@
+# Autoclicker sourcecode
+import tkinter as tk
+from tkinter import ttk
+import threading
+import time
+import ctypes
+import keyboard
+import mouse
+
+# ─────────────────────────────────────────────
+#  ULTRA-FAST INPUT via ctypes (no overhead)
+# ─────────────────────────────────────────────
+MOUSEEVENTF_LEFTDOWN   = 0x0002
+MOUSEEVENTF_LEFTUP     = 0x0004
+MOUSEEVENTF_RIGHTDOWN  = 0x0008
+MOUSEEVENTF_RIGHTUP    = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP   = 0x0040
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         ctypes.c_ushort),
+        ("wScan",       ctypes.c_ushort),
+        ("dwFlags",     ctypes.c_ulong),
+        ("time",        ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT), ("_pad", ctypes.c_byte * 24)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("_input", _INPUT_UNION)]
+
+def fast_mouse_click(button="left"):
+    if button == "left":
+        down, up = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+    elif button == "right":
+        down, up = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+    else:
+        down, up = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
+    ctypes.windll.user32.mouse_event(down, 0, 0, 0, 0)
+    ctypes.windll.user32.mouse_event(up,   0, 0, 0, 0)
+
+def fast_key_click(vk_code):
+    extra = ctypes.c_ulong(0)
+    ii = _INPUT_UNION()
+    ii.ki = KEYBDINPUT(vk_code, 0, 0, 0, ctypes.pointer(extra))
+    inp = INPUT(INPUT_KEYBOARD, ii)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    ii2 = _INPUT_UNION()
+    ii2.ki = KEYBDINPUT(vk_code, 0, KEYEVENTF_KEYUP, 0, ctypes.pointer(extra))
+    inp2 = INPUT(INPUT_KEYBOARD, ii2)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp2), ctypes.sizeof(inp2))
+
+# High-resolution sleep using Windows timer
+def hr_sleep(seconds):
+    """High-resolution sleep using Windows multimedia timer."""
+    if seconds <= 0:
+        return
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        remaining = deadline - time.perf_counter()
+        if remaining > 0.002:
+            time.sleep(remaining * 0.5)
+        # spin for last 2ms for accuracy
+
+# ─────────────────────────────────────────────
+#  COLORS & FONTS
+# ─────────────────────────────────────────────
+BG        = "#0d0f14"
+PANEL     = "#161922"
+BORDER    = "#252a35"
+ACCENT    = "#00e5a0"
+ACCENT2   = "#0096ff"
+TEXT      = "#e8eaf0"
+TEXT_DIM  = "#5a6070"
+RED       = "#ff4757"
+YELLOW    = "#ffa502"
+
+FONT_HEAD  = ("Courier New", 22, "bold")
+FONT_LABEL = ("Courier New", 9)
+FONT_MONO  = ("Courier New", 11, "bold")
+FONT_SMALL = ("Courier New", 8)
+FONT_BIG   = ("Courier New", 28, "bold")
+FONT_MED   = ("Courier New", 13, "bold")
+
+# ─────────────────────────────────────────────
+#  TOOLTIP HELPER
+# ─────────────────────────────────────────────
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _=None):
+        x, y, _, _ = self.widget.bbox("insert") if hasattr(self.widget, 'bbox') else (0, 0, 0, 0)
+        x += self.widget.winfo_rootx() + 20
+        y += self.widget.winfo_rooty() + 20
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(self.tip, text=self.text, bg=BORDER, fg=TEXT_DIM,
+                       font=FONT_SMALL, padx=6, pady=3, bd=0, relief="flat")
+        lbl.pack()
+
+    def hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+# ─────────────────────────────────────────────
+#  FLAT BUTTON
+# ─────────────────────────────────────────────
+class FlatBtn(tk.Label):
+    def __init__(self, parent, text, command=None, accent=False, danger=False, **kw):
+        color = ACCENT if accent else (RED if danger else BORDER)
+        fg    = BG if accent else (TEXT if not danger else TEXT)
+        super().__init__(parent, text=text, bg=color, fg=fg,
+                         font=FONT_LABEL, padx=12, pady=5, cursor="hand2", **kw)
+        self._base = color
+        self._fg   = fg
+        self.command = command
+        self.bind("<Button-1>", lambda e: command() if command else None)
+        self.bind("<Enter>",    self._on_enter)
+        self.bind("<Leave>",    self._on_leave)
+
+    def _on_enter(self, _):
+        factor = 1.2
+        r = min(255, int(self._base[1:3], 16) * factor) if self._base != BORDER else 40
+        self.config(bg=ACCENT if self._base == ACCENT else
+                    RED if self._base == RED else "#2a2f3d")
+
+    def _on_leave(self, _):
+        self.config(bg=self._base)
+
+# ─────────────────────────────────────────────
+#  TOGGLE SWITCH
+# ─────────────────────────────────────────────
+class ToggleSwitch(tk.Canvas):
+    def __init__(self, parent, variable, command=None, **kw):
+        super().__init__(parent, width=44, height=22, bg=PANEL,
+                         highlightthickness=0, cursor="hand2", **kw)
+        self.var = variable
+        self.command = command
+        self.bind("<Button-1>", self._toggle)
+        self._draw()
+        self.var.trace_add("write", lambda *_: self._draw())
+
+    def _toggle(self, _):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        on = self.var.get()
+        track_color = ACCENT if on else BORDER
+        self.create_rounded_rect(2, 4, 42, 18, 7, fill=track_color)
+        cx = 32 if on else 12
+        self.create_oval(cx - 8, 3, cx + 8, 19, fill=TEXT if on else TEXT_DIM, outline="")
+
+    def create_rounded_rect(self, x1, y1, x2, y2, r, **kw):
+        self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90,  extent=90,  style="pieslice", **kw)
+        self.create_arc(x2-2*r, y1, x2, y1+2*r, start=0,   extent=90,  style="pieslice", **kw)
+        self.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90,  style="pieslice", **kw)
+        self.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90,  style="pieslice", **kw)
+        self.create_rectangle(x1+r, y1, x2-r, y2, **kw)
+        self.create_rectangle(x1, y1+r, x2, y2-r, **kw)
+
+# ─────────────────────────────────────────────
+#  SEPARATOR
+# ─────────────────────────────────────────────
+def hsep(parent):
+    tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", pady=8)
+
+# ─────────────────────────────────────────────
+#  MAIN APP
+# ─────────────────────────────────────────────
+class OSSIKIAutoPresser:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("OSSIKI Auto Presser")
+        self.root.geometry("420x620")
+        self.root.configure(bg=BG)
+        self.root.resizable(False, False)
+
+        # ── State ──
+        self.target_key_var     = tk.StringVar(value="a")
+        self.target_vk          = ord("A")          # virtual key code
+        self.interval_var       = tk.IntVar(value=50)
+        self.max_speed_var      = tk.BooleanVar(value=False)
+        self.hold_var           = tk.BooleanVar(value=False)
+        self.mode_var           = tk.StringVar(value="Keyboard")
+        self.mouse_btn_var      = tk.StringVar(value="left")
+        self.toggle_hotkey_var  = tk.StringVar(value="f8")
+        self.jitter_var         = tk.BooleanVar(value=False)
+        self.jitter_pct_var     = tk.IntVar(value=20)
+        self.repeat_limit_var   = tk.BooleanVar(value=False)
+        self.repeat_count_var   = tk.IntVar(value=100)
+
+        self.running       = False
+        self.held          = False
+        self.click_thread  = None
+        self.current_hotkey = None
+        self.count         = 0
+        self.cps           = 0.0
+        self._cps_window   = []
+
+        # ── Build UI ──
+        self._build_header()
+        self._build_status_panel()
+        self._build_body()
+        self._build_footer()
+
+        self.apply_hotkey()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._cps_updater()
+        self.root.mainloop()
+
+    # ══════════════════ UI BUILDERS ══════════════════
+
+    def _build_header(self):
+        hdr = tk.Frame(self.root, bg=PANEL, pady=0)
+        hdr.pack(fill="x")
+
+        inner = tk.Frame(hdr, bg=PANEL)
+        inner.pack(fill="x", padx=18, pady=14)
+
+        left = tk.Frame(inner, bg=PANEL)
+        left.pack(side="left")
+
+        tk.Label(left, text="OSSIKI", font=FONT_HEAD,
+                 fg=ACCENT, bg=PANEL).pack(side="left")
+        tk.Label(left, text=" AUTO PRESSER", font=("Courier New", 10, "bold"),
+                 fg=TEXT_DIM, bg=PANEL).pack(side="left", padx=2, pady=6)
+
+        # Version badge
+        badge = tk.Label(inner, text="v2.0", font=FONT_SMALL,
+                         bg=BORDER, fg=TEXT_DIM, padx=6, pady=2)
+        badge.pack(side="right")
+
+        tk.Frame(self.root, bg=ACCENT, height=2).pack(fill="x")
+
+    def _build_status_panel(self):
+        panel = tk.Frame(self.root, bg=PANEL, pady=0)
+        panel.pack(fill="x")
+
+        inner = tk.Frame(panel, bg=PANEL)
+        inner.pack(fill="x", padx=18, pady=12)
+
+        # Status indicator
+        left = tk.Frame(inner, bg=PANEL)
+        left.pack(side="left")
+
+        self.status_dot = tk.Canvas(left, width=12, height=12, bg=PANEL,
+                                    highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(0, 6))
+        self._dot_oval = self.status_dot.create_oval(1, 1, 11, 11, fill=RED, outline="")
+
+        self.status_label = tk.Label(left, text="STOPPED",
+                                     font=FONT_MED, fg=RED, bg=PANEL)
+        self.status_label.pack(side="left")
+
+        # CPS display
+        right = tk.Frame(inner, bg=PANEL)
+        right.pack(side="right")
+
+        tk.Label(right, text="CPS", font=FONT_SMALL,
+                 fg=TEXT_DIM, bg=PANEL).pack(side="left", padx=(0, 4))
+        self.cps_label = tk.Label(right, text="0.0",
+                                  font=FONT_MED, fg=ACCENT2, bg=PANEL, width=6, anchor="e")
+        self.cps_label.pack(side="left")
+
+        # Count strip
+        count_row = tk.Frame(panel, bg=PANEL)
+        count_row.pack(fill="x", padx=18, pady=(0, 10))
+
+        tk.Label(count_row, text="TOTAL PRESSES", font=FONT_SMALL,
+                 fg=TEXT_DIM, bg=PANEL).pack(side="left")
+
+        self.count_label = tk.Label(count_row, text="0",
+                                    font=FONT_MED, fg=ACCENT, bg=PANEL)
+        self.count_label.pack(side="right")
+
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
+
+    def _build_body(self):
+        body = tk.Frame(self.root, bg=BG)
+        body.pack(fill="both", expand=True, padx=18, pady=12)
+
+        # ─ Mode ─
+        self._section_label(body, "MODE")
+        mode_row = tk.Frame(body, bg=BG)
+        mode_row.pack(fill="x", pady=(4, 10))
+
+        self.mode_kb_btn  = self._mode_btn(mode_row, "⌨  Keyboard", "Keyboard")
+        self.mode_ms_btn  = self._mode_btn(mode_row, "🖱  Mouse",    "Mouse")
+        self._update_mode_btns()
+
+        # ─ Key / Mouse selector ─
+        self.key_frame = tk.Frame(body, bg=BG)
+        self._section_label(self.key_frame, "TARGET KEY")
+        krow = tk.Frame(self.key_frame, bg=BG)
+        krow.pack(fill="x", pady=(4, 0))
+
+        self.key_display = tk.Label(krow, text="A", font=FONT_BIG,
+                                    fg=ACCENT, bg=PANEL, width=4,
+                                    pady=10, relief="flat")
+        self.key_display.pack(side="left", padx=(0, 10))
+
+        FlatBtn(krow, "CAPTURE KEY", command=self.start_key_capture,
+                accent=True).pack(side="left")
+
+        self.mouse_frame = tk.Frame(body, bg=BG)
+        self._section_label(self.mouse_frame, "MOUSE BUTTON")
+        mrow = tk.Frame(self.mouse_frame, bg=BG)
+        mrow.pack(fill="x", pady=(4, 0))
+        for btn in ["left", "right", "middle"]:
+            b = tk.Label(mrow, text=btn.upper(), font=FONT_LABEL,
+                         bg=BORDER, fg=TEXT, padx=14, pady=6, cursor="hand2")
+            b.pack(side="left", padx=(0, 6))
+            b.bind("<Button-1>", lambda e, v=btn, w=b: self._pick_mouse_btn(v))
+            setattr(self, f"_mbtn_{btn}", b)
+        self._update_mouse_btns()
+
+        self.key_frame.pack(fill="x", pady=(0, 12))
+
+        # ─ Interval ─
+        hsep(body)
+        self.interval_frame = tk.Frame(body, bg=BG)
+        self.interval_frame.pack(fill="x", pady=(0, 8))
+
+        left_col = tk.Frame(self.interval_frame, bg=BG)
+        left_col.pack(side="left", fill="x", expand=True)
+        self._section_label(left_col, "INTERVAL (ms)")
+
+        irow = tk.Frame(left_col, bg=BG)
+        irow.pack(fill="x", pady=(4, 0))
+
+        self.interval_entry = tk.Entry(irow, textvariable=self.interval_var,
+                                       font=FONT_MONO, bg=PANEL, fg=ACCENT,
+                                       insertbackground=ACCENT, relief="flat",
+                                       width=8, bd=0)
+        self.interval_entry.pack(side="left")
+        tk.Frame(irow, bg=BORDER, width=1, height=22).pack(side="left", padx=8)
+
+        for v in [10, 50, 100, 500]:
+            lbl = tk.Label(irow, text=str(v), font=FONT_SMALL,
+                           bg=BORDER, fg=TEXT_DIM, padx=8, pady=4, cursor="hand2")
+            lbl.pack(side="left", padx=2)
+            lbl.bind("<Button-1>", lambda e, val=v: self.interval_var.set(val))
+
+        # ─ Toggles ─
+        hsep(body)
+        self._section_label(body, "OPTIONS")
+
+        opt_grid = tk.Frame(body, bg=BG)
+        opt_grid.pack(fill="x", pady=(6, 0))
+
+        self._toggle_row(opt_grid, "As fast as possible",
+                         "Bypasses interval — uses minimal sleep for max CPS",
+                         self.max_speed_var, self._on_maxspeed, 0)
+        self._toggle_row(opt_grid, "Hold mode",
+                         "Holds the key/button down instead of tapping",
+                         self.hold_var, self._on_hold, 1)
+        self._toggle_row(opt_grid, "Interval jitter",
+                         "Randomises each interval slightly (more human-like)",
+                         self.jitter_var, None, 2)
+        self._toggle_row(opt_grid, "Repeat limit",
+                         "Stop automatically after N presses",
+                         self.repeat_limit_var, self._on_repeat_limit, 3)
+
+        # Jitter sub-row
+        self.jitter_sub = tk.Frame(body, bg=BG)
+        tk.Label(self.jitter_sub, text="Jitter ±", font=FONT_LABEL,
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
+        tk.Entry(self.jitter_sub, textvariable=self.jitter_pct_var,
+                 font=FONT_MONO, bg=PANEL, fg=ACCENT, insertbackground=ACCENT,
+                 relief="flat", width=4, bd=0).pack(side="left", padx=4)
+        tk.Label(self.jitter_sub, text="%", font=FONT_LABEL,
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
+
+        self.repeat_sub = tk.Frame(body, bg=BG)
+        tk.Label(self.repeat_sub, text="Stop after", font=FONT_LABEL,
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
+        tk.Entry(self.repeat_sub, textvariable=self.repeat_count_var,
+                 font=FONT_MONO, bg=PANEL, fg=ACCENT, insertbackground=ACCENT,
+                 relief="flat", width=6, bd=0).pack(side="left", padx=4)
+        tk.Label(self.repeat_sub, text="presses", font=FONT_LABEL,
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
+
+        # ─ Hotkey ─
+        hsep(body)
+        self._section_label(body, "TOGGLE HOTKEY")
+        hrow = tk.Frame(body, bg=BG)
+        hrow.pack(fill="x", pady=(4, 0))
+
+        self.hotkey_display = tk.Label(hrow, text="F8", font=FONT_MONO,
+                                       fg=ACCENT2, bg=PANEL, padx=14, pady=6)
+        self.hotkey_display.pack(side="left", padx=(0, 10))
+
+        FlatBtn(hrow, "CAPTURE HOTKEY", command=self.start_hotkey_capture
+                ).pack(side="left")
+
+    def _build_footer(self):
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
+        footer = tk.Frame(self.root, bg=PANEL, pady=10)
+        footer.pack(fill="x")
+
+        inner = tk.Frame(footer, bg=PANEL)
+        inner.pack(padx=18)
+
+        FlatBtn(inner, "▶  START / STOP",
+                command=self.toggle_clicker, accent=True).pack(side="left", padx=(0, 8))
+        FlatBtn(inner, "TEST ONCE",
+                command=self.test_action).pack(side="left", padx=(0, 8))
+        FlatBtn(inner, "RESET",
+                command=self.reset_counter).pack(side="left")
+
+    # ══════════════════ HELPERS ══════════════════
+
+    def _section_label(self, parent, text):
+        tk.Label(parent, text=text, font=FONT_SMALL,
+                 fg=TEXT_DIM, bg=BG if parent.cget("bg") == BG else PANEL,
+                 anchor="w").pack(fill="x")
+
+    def _mode_btn(self, parent, label, value):
+        btn = tk.Label(parent, text=label, font=FONT_LABEL,
+                       bg=BORDER, fg=TEXT, padx=16, pady=8, cursor="hand2")
+        btn.pack(side="left", padx=(0, 6))
+        btn.bind("<Button-1>", lambda e: self._set_mode(value))
+        return btn
+
+    def _update_mode_btns(self):
+        mode = self.mode_var.get()
+        self.mode_kb_btn.config(bg=ACCENT,  fg=BG)   if mode == "Keyboard" else \
+        self.mode_kb_btn.config(bg=BORDER,  fg=TEXT)
+        self.mode_ms_btn.config(bg=ACCENT,  fg=BG)   if mode == "Mouse" else \
+        self.mode_ms_btn.config(bg=BORDER,  fg=TEXT)
+
+    def _set_mode(self, value):
+        self.mode_var.set(value)
+        self._update_mode_btns()
+        if value == "Keyboard":
+            self.mouse_frame.pack_forget()
+            self.key_frame.pack(fill="x", pady=(0, 12))
+        else:
+            self.key_frame.pack_forget()
+            self.mouse_frame.pack(fill="x", pady=(0, 12))
+
+    def _pick_mouse_btn(self, value):
+        self.mouse_btn_var.set(value)
+        self._update_mouse_btns()
+
+    def _update_mouse_btns(self):
+        sel = self.mouse_btn_var.get()
+        for btn in ["left", "right", "middle"]:
+            w = getattr(self, f"_mbtn_{btn}")
+            w.config(bg=ACCENT2 if btn == sel else BORDER,
+                     fg=BG     if btn == sel else TEXT)
+
+    def _toggle_row(self, parent, label, tip, var, command, row):
+        fr = tk.Frame(parent, bg=BG)
+        fr.grid(row=row, column=0, sticky="ew", pady=4)
+
+        sw = ToggleSwitch(fr, var, command=command)
+        sw.pack(side="left", padx=(0, 10))
+
+        lbl = tk.Label(fr, text=label, font=FONT_LABEL, fg=TEXT, bg=BG, anchor="w")
+        lbl.pack(side="left")
+        Tooltip(lbl, tip)
+
+    def _on_maxspeed(self):
+        pass  # just reads the var in spam_loop
+
+    def _on_hold(self):
+        pass
+
+    def _on_repeat_limit(self):
+        if self.repeat_limit_var.get():
+            self.repeat_sub.pack(fill="x", pady=(2, 6))
+        else:
+            self.repeat_sub.pack_forget()
+
+    # ══════════════════ CAPTURE ══════════════════
+
+    def start_key_capture(self):
+        if self.current_hotkey:
+            try: keyboard.remove_hotkey(self.current_hotkey)
+            except: pass
+        self.status_label.config(text="WAITING…", fg=YELLOW)
+        self.status_dot.itemconfig(self._dot_oval, fill=YELLOW)
+        threading.Thread(target=self._capture_key_thread, daemon=True).start()
+
+    def _capture_key_thread(self):
+        try:
+            event = keyboard.read_event(suppress=True)
+            if event.event_type == keyboard.KEY_DOWN:
+                key = event.name
+                vk  = event.scan_code
+                display = key.upper() if len(key) == 1 else key.title()
+                self.target_key_var.set(key)
+                self.target_vk = vk
+                self.root.after(0, lambda d=display: self.key_display.config(text=d))
+        except: pass
+        self.root.after(0, self._restore_stopped)
+        self.root.after(0, self.apply_hotkey)
+
+    def start_hotkey_capture(self):
+        if self.current_hotkey:
+            try: keyboard.remove_hotkey(self.current_hotkey)
+            except: pass
+        self.hotkey_display.config(text="?", fg=YELLOW)
+        self.status_label.config(text="WAITING…", fg=YELLOW)
+        self.status_dot.itemconfig(self._dot_oval, fill=YELLOW)
+        threading.Thread(target=self._capture_hotkey_thread, daemon=True).start()
+
+    def _capture_hotkey_thread(self):
+        try:
+            event = keyboard.read_event(suppress=True)
+            if event.event_type == keyboard.KEY_DOWN:
+                key = event.name
+                self.toggle_hotkey_var.set(key)
+                display = key.upper() if len(key) == 1 else key.title()
+                self.root.after(0, lambda d=display: self.hotkey_display.config(text=d, fg=ACCENT2))
+        except: pass
+        self.root.after(0, self._restore_stopped)
+        self.root.after(0, self.apply_hotkey)
+
+    # ══════════════════ HOTKEY ══════════════════
+
+    def apply_hotkey(self):
+        if self.current_hotkey:
+            try: keyboard.remove_hotkey(self.current_hotkey)
+            except: pass
+        hot = self.toggle_hotkey_var.get().strip()
+        if hot:
+            try:
+                self.current_hotkey = keyboard.add_hotkey(hot, self.toggle_clicker, suppress=True)
+            except:
+                self.status_label.config(text="INVALID HOTKEY", fg=RED)
+
+    # ══════════════════ TOGGLE ══════════════════
+
+    def toggle_clicker(self):
+        self.running = not self.running
+        if self.running:
+            self.root.after(0, self._set_running_ui)
+            if self.hold_var.get():
+                self._do_press()
+                self.held = True
+            else:
+                if not self.click_thread or not self.click_thread.is_alive():
+                    self.count_at_start = self.count
+                    self.click_thread = threading.Thread(
+                        target=self._spam_loop, daemon=True)
+                    self.click_thread.start()
+        else:
+            self.root.after(0, self._restore_stopped)
+            if self.held:
+                self._do_release()
+                self.held = False
+
+    def _set_running_ui(self):
+        self.status_label.config(text="RUNNING", fg=ACCENT)
+        self.status_dot.itemconfig(self._dot_oval, fill=ACCENT)
+
+    def _restore_stopped(self):
+        self.status_label.config(text="STOPPED", fg=RED)
+        self.status_dot.itemconfig(self._dot_oval, fill=RED)
+
+    # ══════════════════ PRESS / RELEASE ══════════════════
+
+    def _do_press(self):
+        if self.mode_var.get() == "Keyboard":
+            key = self.target_key_var.get().strip()
+            if key:
+                try: keyboard.press(key)
+                except: pass
+        else:
+            try: mouse.press(self.mouse_btn_var.get())
+            except: pass
+
+    def _do_release(self):
+        if self.mode_var.get() == "Keyboard":
+            key = self.target_key_var.get().strip()
+            if key:
+                try: keyboard.release(key)
+                except: pass
+        else:
+            try: mouse.release(self.mouse_btn_var.get())
+            except: pass
+
+    # ══════════════════ SPAM LOOP (OPTIMISED) ══════════════════
+
+    def _spam_loop(self):
+        import random
+        is_keyboard = (self.mode_var.get() == "Keyboard")
+        key         = self.target_key_var.get().strip()
+        btn         = self.mouse_btn_var.get()
+
+        # Pre-read toggles once per loop start (avoids tkinter calls inside loop)
+        max_speed   = self.max_speed_var.get()
+        use_jitter  = self.jitter_var.get()
+        jitter_pct  = self.jitter_pct_var.get() / 100.0
+        has_limit   = self.repeat_limit_var.get()
+        limit       = self.repeat_count_var.get() if has_limit else 0
+        interval    = self.interval_var.get() / 1000.0
+
+        loop_count  = 0
+
+        while self.running:
+            # ── CLICK ──
+            try:
+                if is_keyboard:
+                    keyboard.press_and_release(key)
+                else:
+                    fast_mouse_click(btn)
+            except:
+                pass
+
+            # ── COUNT ──
+            loop_count += 1
+            self.count += 1
+            ts = time.perf_counter()
+            self._cps_window.append(ts)
+
+            # trim window older than 1s
+            cutoff = ts - 1.0
+            while self._cps_window and self._cps_window[0] < cutoff:
+                self._cps_window.pop(0)
+
+            # Check repeat limit
+            if has_limit and loop_count >= limit:
+                self.running = False
+                self.root.after(0, self._restore_stopped)
+                break
+
+            # ── SLEEP ──
+            if max_speed:
+                # Ultra-fast: yield once per click to avoid 100% CPU lockup
+                time.sleep(0.0005)
+            else:
+                delay = interval
+                if use_jitter:
+                    delay *= (1.0 + random.uniform(-jitter_pct, jitter_pct))
+                    delay = max(0.001, delay)
+                hr_sleep(delay)
+
+    # ══════════════════ CPS UPDATER ══════════════════
+
+    def _cps_updater(self):
+        # Calculate CPS from rolling window
+        now = time.perf_counter()
+        cutoff = now - 1.0
+        while self._cps_window and self._cps_window[0] < cutoff:
+            self._cps_window.pop(0)
+        cps = len(self._cps_window)
+        self.cps_label.config(text=f"{cps}")
+        self.count_label.config(text=f"{self.count:,}")
+        self.root.after(100, self._cps_updater)
+
+    # ══════════════════ MISC ══════════════════
+
+    def test_action(self):
+        try:
+            if self.mode_var.get() == "Keyboard":
+                keyboard.press_and_release(self.target_key_var.get().strip())
+            else:
+                fast_mouse_click(self.mouse_btn_var.get())
+        except: pass
+        self.count += 1
+
+    def reset_counter(self):
+        self.count = 0
+        self._cps_window.clear()
+        self.count_label.config(text="0")
+        self.cps_label.config(text="0")
+
+    def on_close(self):
+        self.running = False
+        if self.held:
+            self._do_release()
+        if self.current_hotkey:
+            try: keyboard.remove_hotkey(self.current_hotkey)
+            except: pass
+        self.root.destroy()
+
+
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    # pip install keyboard mouse
+    # pyinstaller --onefile --windowed Autoclicker.py
+    app = OSSIKIAutoPresser()
